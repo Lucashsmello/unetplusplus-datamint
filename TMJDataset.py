@@ -12,6 +12,11 @@ from datamint import Api
 
 PROJECT_NAME = "TMJ Test"
 NUM_CLASSES = 4
+CLASS_MAP = {
+    "Disc": 1,
+    "Condyle": 2,
+    "Eminence": 3,
+}
 
 api = Api()
 
@@ -52,7 +57,7 @@ class TMJDataset2D(Dataset):
         
         for ann in all_annotations:
             self.resource_annotations[ann.resource_id].append(ann)
-            
+                    
         self._volume_cache = {}
         self._mask_volume_cache = {}
 
@@ -73,7 +78,8 @@ class TMJDataset2D(Dataset):
             for ann in anns:
                 try:
                     raw = ann.fetch_file_data(auto_convert=True, use_cache=True)
-
+                    label_name = ann.identifier 
+                    
                     if isinstance(raw, (bytes, bytearray)):
                         tmp_path = os.path.join(
                             self._mask_tmp_dir,
@@ -86,7 +92,7 @@ class TMJDataset2D(Dataset):
 
                         nii = nib.load(tmp_path)
                         data = nii.dataobj  
-                        vol = np.asarray(data)                        
+                        vol = np.asarray(data)                      
 
                     elif hasattr(raw, "get_fdata"):
                         vol = raw.get_fdata()
@@ -94,7 +100,7 @@ class TMJDataset2D(Dataset):
                         vol = np.asarray(raw)
 
                     vol = np.asarray(vol, dtype=np.int64)
-                    self._mask_volume_cache[resource_id].append(vol)
+                    self._mask_volume_cache[resource_id].append((label_name, vol))
 
                 except Exception as e:
                     print(
@@ -114,34 +120,34 @@ class TMJDataset2D(Dataset):
                             
     def __len__(self):
         return len(self.slice_index)
-
+    
     def __getitem__(self, idx):
         resource_id, slice_idx = self.slice_index[idx]
 
-        ''' Load corresponding image slice '''
+        ''' Get resource and cached volume '''
         vol = self._volume_cache[resource_id]
 
         image = vol[:, :, slice_idx].astype(np.float32)
 
         original_height, original_width = image.shape
 
-        ''' Load corresponding mask '''
-        cached_masks = self._mask_volume_cache.get(resource_id, [])
+        ''' Build segmentation mask for the slice '''
+        mask = np.zeros((original_height, original_width), dtype=np.int64)
 
-        if not cached_masks:
-            mask = np.zeros((original_height, original_width), dtype=np.int64)
-        else:
-            masks = []
+        for label_name, mask_vol in self._mask_volume_cache.get(resource_id, []):
+            if label_name not in CLASS_MAP:
+                continue
 
-            for vol in cached_masks:
-                if vol.ndim == 3 and slice_idx < vol.shape[2]:
-                    masks.append(vol[:,:, slice_idx])
-                elif vol.ndim == 2:
-                    masks.append(vol)
-                    
-            
-            mask = np.maximum.reduce(masks) if masks else np.zeros((original_height, original_width), dtype=np.int64)
-        
+            cls = CLASS_MAP[label_name]
+
+            if mask_vol.ndim == 3 and slice_idx < vol.shape[2]:
+                slice_mask = mask_vol[:, :, slice_idx]
+            elif mask_vol.ndim == 2:
+                slice_mask = mask_vol
+            else:
+                continue
+
+            mask[slice_mask > 0] = cls
 
         image = np.rot90(image, k=3)
         mask  = np.rot90(mask, k=3)
@@ -159,7 +165,7 @@ class TMJDataset2D(Dataset):
         image = torch.from_numpy(image).unsqueeze(0).float()  # (1, H, W)
         mask = torch.from_numpy(mask).long()                  # (H, W)
 
-        ''' Data augmentation '''
+        ''' Data Augmentation '''
         if self.augmentation:
             image, mask = self.randomTransform(image, mask)
 
@@ -167,8 +173,11 @@ class TMJDataset2D(Dataset):
             "image": image,
             "mask": mask,
             "filename": f"{resource_id}_z{slice_idx:03d}",
+            "patient_id": resource_id,
+            "slice_idx": slice_idx,
         }
 
+    # ---------------------------------------------------------------------------------------------------------------------------------
     """
     Taken from: https://github.com/aswahd/TMJ-Disk-Dislocation-Classification/blob/main/UNetPPTMJ/dataloading/TMJDataset.py
     Apply random transformations to the image and label.

@@ -145,7 +145,7 @@ if __name__ == "__main__":
     ''' MLflow logger '''
     mlflow_logger = MLFlowLogger(
         experiment_name=f"{PROJECT_NAME}_training",
-        run_name="unetpp_resnet34_first_training",
+        run_name="unetpp_resnet34_seventh_training",
     )
 
     print("Training callbacks configured.")    
@@ -156,6 +156,7 @@ if __name__ == "__main__":
         callbacks=[checkpoint_callback],
         accelerator='auto',                   # Auto-detect GPU/CPU
         devices=1,                            # Single device
+        precision='16-mixed', 
         log_every_n_steps=10,                 # Log frequency
         num_sanity_val_steps=2,               # Validation sanity check
     )

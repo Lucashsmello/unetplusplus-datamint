@@ -2,8 +2,11 @@ import torch
 import lightning as L
 import segmentation_models_pytorch as smp
 from torchmetrics.segmentation import MeanIoU, GeneralizedDiceScore
+from collections import defaultdict
+
 from losses import DiceLoss, FusionLoss, FocalLoss
 from learningRate import CyclicLR, WarmUpLR, CosineLR  
+import numpy as np
     
 class UNetPPModule(L.LightningModule):
     """
@@ -28,11 +31,16 @@ class UNetPPModule(L.LightningModule):
     ):
         super().__init__()
         self.save_hyperparameters()
-
+        self.test_outputs = []
         self.num_classes = num_classes
         self.base_lr = learning_rate
         self.total_epochs = total_epochs
-
+        self.class_id_to_name = {
+            1: "Disc",
+            2: "Condyle",
+            3: "Eminence",
+        }
+        
         self.model = smp.UnetPlusPlus(
             encoder_name=encoder_name,
             in_channels=in_channels,
@@ -42,12 +50,11 @@ class UNetPPModule(L.LightningModule):
 
         loss_fn0 = DiceLoss(weights=[0.1, 5, 1, 1], use_softmax=True)
         loss_fn1 = FocalLoss(gamma=3)
-        self.criterion = FusionLoss([loss_fn0, loss_fn1], weights=[0.5, 0.5], device="cpu")  
+        self.criterion = FusionLoss([loss_fn0, loss_fn1], weights=[0.5, 0.5], device="cpu") 
 
         self.iou_metrics = {
             "train": MeanIoU(num_classes=num_classes, per_class=False),
             "val": MeanIoU(num_classes=num_classes, per_class=False),
-            "test": MeanIoU(num_classes=num_classes, per_class=False),
         }
         for stage, metric in self.iou_metrics.items():
             self.add_module(f"{stage}_mean_iou", metric)
@@ -55,7 +62,6 @@ class UNetPPModule(L.LightningModule):
         self.dice_metrics = {
             "train": GeneralizedDiceScore(num_classes=num_classes),
             "val": GeneralizedDiceScore(num_classes=num_classes),
-            "test": GeneralizedDiceScore(num_classes=num_classes),
         }
         for stage, metric in self.dice_metrics.items():
             self.add_module(f"{stage}_dice_score", metric)
@@ -101,8 +107,25 @@ class UNetPPModule(L.LightningModule):
     def validation_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
         return self._common_step(batch, "val")
 
-    def test_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
-        return self._common_step(batch, "test")
+    def test_step(self, batch: dict, batch_idx: int):
+        images = batch["image"]
+        masks = batch["mask"]
+        patient_ids = batch["patient_id"]
+        slice_idxs = batch["slice_idx"]
+
+        logits = self(images)
+        preds = torch.argmax(logits, dim=1)
+
+        out = {
+            "preds": preds.detach().cpu(),
+            "masks": masks.detach().cpu(),
+            "patient_id": patient_ids,
+            "slice_idx": slice_idxs,
+        }
+
+        self.test_outputs.append(out)
+        return out
+
 
     def predict_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
         images = batch["image"]
@@ -115,7 +138,6 @@ class UNetPPModule(L.LightningModule):
         dice = self.dice_metrics[stage].compute()
         self.log(f"{stage}/iou", iou, prog_bar=True)
         self.log(f"{stage}/dice", dice, prog_bar=False)
-
         self.iou_metrics[stage].reset()
         self.dice_metrics[stage].reset()
 
@@ -126,7 +148,70 @@ class UNetPPModule(L.LightningModule):
         self._common_epoch_end("val")
 
     def on_test_epoch_end(self):
-        self._common_epoch_end("test")
+        patients = defaultdict(lambda: {"preds": {}, "gts": {}})
+
+        for out in self.test_outputs:
+            preds = out["preds"]
+            gts = out["masks"]
+            pids = out["patient_id"]
+            sids = out["slice_idx"]
+
+            if torch.is_tensor(sids):
+                sids = sids.tolist()
+            if torch.is_tensor(pids):
+                pids = pids.tolist()
+
+            for i in range(len(preds)):
+                pid = str(pids[i])
+                z = int(sids[i])
+                patients[pid]["preds"][z] = preds[i]
+                patients[pid]["gts"][z] = gts[i]
+
+        dice_per_class = defaultdict(list)
+        iou_per_class = defaultdict(list)
+
+        for pid, data in patients.items():
+            zs = sorted(data["preds"].keys())
+            pred_vol = torch.stack([data["preds"][z] for z in zs])
+            gt_vol = torch.stack([data["gts"][z] for z in zs])
+
+            for cls in range(1, self.num_classes):
+                pred_bin = (pred_vol == cls)
+                gt_bin = (gt_vol == cls)
+
+                if gt_bin.sum() == 0:
+                    continue
+
+                inter = (pred_bin & gt_bin).sum().float()
+                union = pred_bin.sum().float() + gt_bin.sum().float() - inter
+
+                dice = (2 * inter + 1e-8) / (pred_bin.sum() + gt_bin.sum() + 1e-8)
+                iou  = (inter + 1e-8) / (union + 1e-8)
+
+                dice_per_class[cls].append(dice.item())
+                iou_per_class[cls].append(iou.item())
+
+        dice_means, iou_means = [], []
+
+        for cls in range(1, self.num_classes):
+            if cls not in dice_per_class:
+                continue
+
+            class_name = self.class_id_to_name.get(cls, f"class_{cls}")
+
+            d = float(np.mean(dice_per_class[cls]))
+            i = float(np.mean(iou_per_class[cls]))
+
+            self.log(f"test/dice_{class_name}", d)
+            self.log(f"test/iou_{class_name}", i)
+
+            dice_means.append(d)
+            iou_means.append(i)
+
+        self.log("test/dice_volume_per_class", float(np.mean(dice_means)))
+        self.log("test/iou_volume_per_class",  float(np.mean(iou_means)))
+
+        self.test_outputs.clear()
 
     # ---------- optimizer + custom LR schedule ----------
     def configure_optimizers(self):
